@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+webhook.json
+state.json
+state-incoming.json
+queue.jsonl
+incoming.jsonl
+handled.txt
+tunnel-url.txt
+local.json
+b2b_window.json
+watcher-state.json
+watch.lock
+*.log

@@ -1,0 +1,6 @@
+id: "custom.telegram-bot"
+title: "Telegram Bot"
+description: "Use the Telegram Bot API as your own bot to read group messages and send messages from Muse."
+include_in_prompt: true
+require_auth: true
+aliases: ["Telegram", "TG bot"]
