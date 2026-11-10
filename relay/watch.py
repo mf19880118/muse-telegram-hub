@@ -19,6 +19,12 @@ long-polls getUpdates (50s server-side waits) and:
 - prints "ERROR <description>" (exit 1) when the API call failed; the
   offset is not advanced in that case.
 
+The slice also owns the watcher heartbeat (watcher-state.json): it is
+refreshed on every poll, so the supervisor sees a watcher on duty for
+the whole slice and the agent has no bookkeeping to do between slices.
+Pass --new-term on the first slice of a takeover or a recovery to
+start a new term (resets started_at).
+
 Boundary rules shared with fetch.py: updates are appended to
 queue.jsonl first and the offset in state.json is advanced only after
 the append, so a crash between slices never loses a fetched update;
@@ -54,6 +60,7 @@ def main() -> int:
     wait_lock = 0
     if "--wait-lock" in sys.argv:
         wait_lock = int(sys.argv[sys.argv.index("--wait-lock") + 1])
+    new_term = "--new-term" in sys.argv
     os.makedirs(BASE, exist_ok=True)
     lock_fh = open(LOCK, "w")
     wait_deadline = time.time() + wait_lock
@@ -66,8 +73,11 @@ def main() -> int:
                 print("LOCKED")
                 return 0
             time.sleep(min(5.0, max(0.1, wait_deadline - time.time())))
+    # Holding the lock means this slice is the watcher on duty.
+    F.beat(new_term=new_term)
     deadline = time.time() + slice_secs
     while True:
+        F.beat()
         # Messages pulled earlier (by this or a previous shift) that are
         # still unanswered and unclaimed are handed out again first.
         due = F.due_pending()
@@ -115,6 +125,7 @@ def main() -> int:
                     continue
                 wake = F.should_wake(record)
                 record["wake"] = wake
+                record["pulled_at"] = int(time.time())
                 qf.write(json.dumps(record, ensure_ascii=False) + "\n")
                 if wake:
                     relevant.append(record)
@@ -124,6 +135,7 @@ def main() -> int:
         F.save_offset(max_id + 1)
         if relevant:
             F.claim([F.record_key(r) for r in relevant])
+            F.beat()  # the agent gets the full grace period to answer
             print(f"RELEVANT {len(relevant)}")
             for r in relevant:
                 print(F.digest(r))

@@ -408,6 +408,183 @@ class Inbox(unittest.TestCase):
         self.assertEqual(out.splitlines()[0], "OPEN 2")
 
 
+class Heartbeat(unittest.TestCase):
+    """The watch slice keeps watcher-state.json fresh by itself, so a
+    quiet 600-second slice no longer looks like a dead watcher to the
+    supervisor run (its limit is 180 seconds)."""
+
+    def setUp(self):
+        self.W = load("watch_beat", HUB, filename="watch.py")
+        self.F = self.W.F
+
+    def run_slice(self, *argv):
+        old = sys.argv
+        sys.argv = ["x"] + list(argv)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = self.W.main()
+        finally:
+            sys.argv = old
+        return rc, buf.getvalue().splitlines()
+
+    def test_first_beat_starts_a_term(self):
+        state = self.F.beat(now=1000.0)
+        self.assertEqual(state, {"started_at": 1000, "beat_at": 1000})
+        self.assertEqual(self.F.load_watcher_state(), state)
+
+    def test_fresh_beats_keep_the_term(self):
+        self.F.beat(now=1000.0)
+        state = self.F.beat(now=1000.0 + self.F.BEAT_STALE - 1)
+        self.assertEqual(state["started_at"], 1000)
+        self.assertEqual(state["beat_at"], 1000 + self.F.BEAT_STALE - 1)
+
+    def test_stale_beat_starts_a_new_term(self):
+        self.F.beat(now=1000.0)
+        state = self.F.beat(now=1000.0 + self.F.BEAT_STALE)
+        self.assertEqual(state["started_at"], 1000 + self.F.BEAT_STALE)
+
+    def test_new_term_flag_resets_a_fresh_term(self):
+        self.F.beat(now=1000.0)
+        state = self.F.beat(new_term=True, now=1010.0)
+        self.assertEqual(state, {"started_at": 1010, "beat_at": 1010})
+
+    def test_corrupt_state_is_tolerated(self):
+        with open(self.F.WATCHER_STATE, "w", encoding="utf-8") as fh:
+            fh.write("not json")
+        self.assertEqual(self.F.beat(now=1000.0)["started_at"], 1000)
+
+    def test_quiet_slice_writes_the_heartbeat(self):
+        before = int(time.time())
+        rc, out = self.run_slice("--slice", "0")
+        self.assertEqual(out, ["NONE"])
+        state = self.F.load_watcher_state()
+        self.assertGreaterEqual(state["beat_at"], before)
+        self.assertGreaterEqual(state["started_at"], before)
+
+    def test_slice_continues_a_running_term(self):
+        started = int(time.time()) - 100
+        with open(self.F.WATCHER_STATE, "w", encoding="utf-8") as fh:
+            json.dump({"started_at": started, "beat_at": started + 90}, fh)
+        self.run_slice("--slice", "0")
+        self.assertEqual(self.F.load_watcher_state()["started_at"], started)
+
+    def test_takeover_slice_starts_a_new_term(self):
+        started = int(time.time()) - 3000
+        with open(self.F.WATCHER_STATE, "w", encoding="utf-8") as fh:
+            json.dump({"started_at": started,
+                       "beat_at": int(time.time()) - 5}, fh)
+        self.run_slice("--slice", "0", "--new-term")
+        self.assertGreater(self.F.load_watcher_state()["started_at"], started)
+
+    def test_locked_slice_leaves_the_heartbeat_alone(self):
+        import fcntl
+        holder = open(self.W.LOCK, "w")
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            rc, out = self.run_slice("--slice", "0", "--new-term")
+        finally:
+            holder.close()
+        self.assertEqual(out, ["LOCKED"])
+        self.assertEqual(self.F.load_watcher_state(), {})
+
+
+class ContextAndTiming(unittest.TestCase):
+    """Messages are handed out with the last few earlier messages of
+    the chat attached, and every reply records how long it took."""
+
+    KEY = "%s:3" % GROUP
+
+    def setUp(self):
+        self.I = load("inbox_ctx", dict(HUB, context_messages=2),
+                      filename="inbox.py")
+        self.F = self.I.F
+        self.sent_at = int(time.time()) - 40
+        batch = [
+            upd(1, "第一句闲聊", OWNER),
+            upd(2, "我在处理别的", OTHER, is_bot=True),
+            upd(9, "别的群的话", OWNER, chat_id=OWNER, chat_type="private"),
+            upd(3, "@Alpha_bot 查一下库存", OWNER),
+            upd(4, "后面才来的话", OWNER),
+        ]
+        for u in batch:
+            u["message"]["date"] = self.sent_at
+        self.F.tg.RESPONSES.append({"ok": True, "result": batch})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.F.main()
+        self.out = buf.getvalue().splitlines()
+
+    def call(self, fn, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = fn(*args)
+        return rc, buf.getvalue().splitlines()
+
+    def line(self, key):
+        return [json.loads(l) for l in self.out[1:]
+                if json.loads(l)["key"] == key][0]
+
+    def test_digest_carries_earlier_messages_of_the_same_chat(self):
+        ctx = self.line(self.KEY)["context"]
+        self.assertEqual([c["text"] for c in ctx],
+                         ["第一句闲聊", "我在处理别的"])
+        self.assertEqual(ctx[1]["from"], "u%s" % OTHER)
+
+    def test_context_respects_the_limit(self):
+        rec = self.F.find_record(self.KEY)
+        self.assertEqual([c["text"] for c in self.F.recent_context(rec, 1)],
+                         ["我在处理别的"])
+        self.assertEqual(self.F.recent_context(rec, 0), [])
+
+    def test_first_message_of_a_chat_has_no_context_field(self):
+        self.assertNotIn("context", self.line("%s:9" % OWNER))
+
+    def test_list_stays_compact(self):
+        rc, out = self.call(self.I.cmd_list)
+        self.assertEqual(out[0], "OPEN 2")
+        self.assertTrue(all("context" not in json.loads(l) for l in out[1:]))
+
+    def test_queue_records_carry_the_pull_time(self):
+        rec = self.F.find_record(self.KEY)
+        self.assertGreaterEqual(rec["pulled_at"], self.sent_at + 40)
+
+    def test_reply_records_where_the_time_went(self):
+        rc, _ = self.call(self.I.cmd_reply, self.KEY, "有货", False)
+        self.assertEqual(rc, 0)
+        with open(self.I.LATENCY, encoding="utf-8") as fh:
+            rows = [json.loads(l) for l in fh]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["key"], self.KEY)
+        self.assertFalse(row["interim"])
+        self.assertGreaterEqual(row["wait_secs"], 40)
+        self.assertLess(row["handle_secs"], 5)
+        self.assertGreaterEqual(row["total_secs"], row["wait_secs"])
+
+    def test_failed_send_records_nothing(self):
+        self.F.tg.FAIL.add("sendMessage")
+        self.call(self.I.cmd_reply, self.KEY, "有货", False)
+        self.assertFalse(os.path.exists(self.I.LATENCY))
+
+    def test_stats_counts_the_first_reply_per_message(self):
+        self.call(self.I.cmd_reply, self.KEY, "收到，开始处理", True)
+        self.call(self.I.cmd_reply, self.KEY, "有货", False)
+        self.call(self.I.cmd_reply, "%s:9" % OWNER, "在", False)
+        rc, out = self.call(self.I.cmd_stats, 20)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out[0], "STATS 2")
+        self.assertTrue(out[1].startswith("MEDIAN sent->first reply "))
+        self.assertIn("sent->pulled", out[1])
+        rows = [json.loads(l) for l in out[2:]]
+        self.assertEqual([r["key"] for r in rows], [self.KEY, "%s:9" % OWNER])
+        self.assertTrue(rows[0]["interim"], "the interim reply came first")
+
+    def test_stats_without_any_reply(self):
+        rc, out = self.call(self.I.cmd_stats, 20)
+        self.assertEqual((rc, out), (0, ["STATS 0"]))
+
+
 class UpstreamBehaviourUnchanged(unittest.TestCase):
     """hub_mode off: every group message is relevant, as before the patch."""
 

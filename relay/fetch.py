@@ -212,6 +212,21 @@ def _cfg_int(name: str, default: int) -> int:
 CLAIM_TTL = _cfg_int("claim_ttl_secs", 600)
 WORKING_TTL = _cfg_int("working_ttl_secs", 3600)
 PENDING_MAX_AGE = _cfg_int("pending_max_age_secs", 86400)
+
+# --- Watcher heartbeat --------------------------------------------------
+# watcher-state.json ({"started_at": ..., "beat_at": ...}) tells the
+# supervisor run (every 10 minutes) whether a watcher is on duty. The
+# watch slice keeps it fresh itself on every poll, at most about 50s
+# apart. Before, the agent refreshed it only between slices, so during
+# a quiet 600-second slice the heartbeat looked stale (the supervisor's
+# limit is 180s) and a healthy watcher could be taken for a dead one.
+WATCHER_STATE = os.path.join(BASE, "watcher-state.json")
+BEAT_STALE = _cfg_int("beat_stale_secs", 180)
+
+# How many earlier messages of the same chat are attached to a message
+# when it is handed to the agent, so that a reply usually needs no
+# extra read of queue.jsonl first.
+CONTEXT_N = _cfg_int("context_messages", 4)
 THROTTLED = os.path.join(BASE, "throttled.log")
 THROTTLE_NOTICE = ("⏸ 机器人之间来回太密，我先暂停接其他 agent 的消息。"
                    "需要继续的话，请主人直接 @ 我。")
@@ -449,6 +464,42 @@ def load_claims() -> dict:
         return {}
 
 
+def load_watcher_state() -> dict:
+    try:
+        with open(WATCHER_STATE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def beat(new_term: bool = False, now: float = None) -> dict:
+    """Refresh the watcher heartbeat and return the state written.
+
+    started_at is kept for as long as the same term goes on. A new term
+    starts when it is asked for (a takeover), when there is no usable
+    state, or when the previous heartbeat is stale: nobody was on duty,
+    so whoever polls now is a new watcher. Best-effort, never raises.
+    """
+    now = time.time() if now is None else now
+    state = load_watcher_state()
+    started = state.get("started_at")
+    last = state.get("beat_at")
+    if (new_term or not isinstance(started, (int, float))
+            or not isinstance(last, (int, float))
+            or now - last >= BEAT_STALE):
+        started = now
+    state = {"started_at": int(started), "beat_at": int(now)}
+    try:
+        tmp = WATCHER_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, WATCHER_STATE)
+    except Exception:
+        pass
+    return state
+
+
 def claim(keys, ttl: int = None, now: float = None) -> None:
     """Mark messages as being worked on until now + ttl."""
     keys = [k for k in keys if k]
@@ -528,7 +579,38 @@ def due_pending(now: float = None) -> list:
     return out
 
 
-def digest(record: dict, redelivered: bool = False) -> str:
+def recent_context(record: dict, limit: int = None) -> list:
+    """The last few earlier messages of the same chat, oldest first.
+
+    Only what this bot received: its own replies are not in the queue.
+    """
+    limit = CONTEXT_N if limit is None else limit
+    if limit <= 0 or record.get("chat_id") is None:
+        return []
+    uid = record.get("update_id")
+    seen = {}
+    for rec in queue_records():
+        if rec.get("chat_id") != record.get("chat_id"):
+            continue
+        if rec.get("kind") not in ("message", "edited_message"):
+            continue
+        if not rec.get("text") or not rec.get("message_id"):
+            continue
+        if rec.get("message_id") == record.get("message_id"):
+            continue
+        if (isinstance(uid, int) and isinstance(rec.get("update_id"), int)
+                and rec["update_id"] >= uid):
+            continue
+        seen.pop(rec["message_id"], None)  # an edit moves it to the end
+        seen[rec["message_id"]] = {
+            "from": rec.get("from_username") or rec.get("from_name"),
+            "text": rec["text"][:160],
+        }
+    return list(seen.values())[-limit:]
+
+
+def digest(record: dict, redelivered: bool = False,
+           context: bool = True) -> str:
     line = {
         "key": record_key(record),
         "chat_id": record.get("chat_id"),
@@ -542,6 +624,10 @@ def digest(record: dict, redelivered: bool = False) -> str:
     }
     if redelivered:
         line["redelivered"] = True
+    if context:
+        earlier = recent_context(record)
+        if earlier:
+            line["context"] = earlier
     return json.dumps(line, ensure_ascii=False)
 
 
@@ -685,6 +771,7 @@ def main() -> int:
                 continue
             wake = should_wake(record)
             record["wake"] = wake
+            record["pulled_at"] = int(time.time())
             qf.write(json.dumps(record, ensure_ascii=False) + "\n")
             if wake:
                 relevant.append(record)

@@ -20,12 +20,12 @@
    - 心跳新鲜（`beat_at` 距今 < 180 秒）且本任年龄（`now - started_at`）< 50 分钟：在岗且年轻 → 本轮直接结束，什么都不做、不发消息、不记日志。
    - 心跳新鲜但年龄 ≥ 50 分钟：该换班了 → 走第 2 条接管流程。
    - 心跳过期（≥ 180 秒）或无文件：watcher 已死或从未启动 → 走第 3 条恢复流程。
-2. 接管流程：运行带等待的切片 `python3 ~/workspace/telegram-relay/watch.py --slice 600 --wait-lock 1800`。它会排队等锁：上一任在切片间隙或到任结束时放锁，本片拿到锁跑完即完成交接。此时你就是新 watcher：把 `watcher-state.json` 的 `started_at` 与 `beat_at` 都重置为当前时间，然后按第 4 条跑满约 60 分钟。若等待约 30 分钟后仍返回 LOCKED（异常），在 `errors.log` 记一行带时间的记录后结束本轮，不发消息。
-3. 恢复流程：先跑一次 `python3 ~/workspace/telegram-relay/fetch.py` 补漏（把 watcher 不在岗期间积压的消息一次拉齐），然后成为 watcher：写 `watcher-state.json`（`started_at` = `beat_at` = 当前时间）；若第一片返回 LOCKED，改用 `--wait-lock 300` 的形式等它释放，再按第 4 条跑满约 60 分钟。
+2. 接管流程：运行带等待的切片 `python3 ~/workspace/telegram-relay/watch.py --slice 600 --wait-lock 1800 --new-term`。它会排队等锁：上一任在切片间隙或到任结束时放锁，本片拿到锁即完成交接，`--new-term` 会让脚本把本任的开始时间记成现在。此时你就是新 watcher，按第 4 条跑满约 60 分钟（从这一片拿到锁算起）。若等待约 30 分钟后仍返回 LOCKED（异常），在 `errors.log` 记一行带时间的记录后结束本轮，不发消息。
+3. 恢复流程：先跑一次 `python3 ~/workspace/telegram-relay/fetch.py` 补漏（把 watcher 不在岗期间积压的消息一次拉齐），有 RELEVANT 就先按第 4 条处理掉，然后成为 watcher：第一片用 `python3 ~/workspace/telegram-relay/watch.py --slice 600 --new-term`；若返回 LOCKED，改用 `--wait-lock 300 --new-term` 等它释放，再按第 4 条跑满约 60 分钟。
 4. 值守循环（watcher 任内，反复执行到本任满约 60 分钟）：
-   - 每片跑完立刻刷新 `watcher-state.json` 的 `beat_at`（`started_at` 不动）。
+   - 心跳由 `watch.py` 自己维护：它在岗期间每次轮询都会刷新 `watcher-state.json`。你不要手写这个文件，片与片之间也不用做任何记账，直接跑下一片（不带 `--new-term`）。
    - NONE：继续下一片。
-   - RELEVANT：输出里每一行是一条派给你的消息（JSON，带 `key`）。逐条处理：需要上下文就读 `~/workspace/telegram-relay/queue.jsonl` 里同一会话的此前记录，按下方发言纪律行动，然后用 `inbox.py` 结案（见「收件与结案」）。本批全部结案后再继续循环。带 `"redelivered": true` 的是之前拉到却一直没人回的消息，照常处理。
+   - RELEVANT：输出里每一行是一条派给你的消息（JSON，带 `key`）。行里的 `context` 是同一会话此前的几条消息（只含你收到的，不含你自己发的），一般够用；确实不够再读 `~/workspace/telegram-relay/queue.jsonl`。逐条处理：按下方发言纪律行动，用 `inbox.py` 结案（见「收件与结案」和「回得快」）。本批全部结案后再继续循环。带 `"redelivered": true` 的是之前拉到却一直没人回的消息，照常处理。
    - LOCKED：说明接管者已经抢到切片、本任已被接替——体面退场：直接结束本轮，不做收尾 fetch，不发消息、不记日志。
    - ERROR：把一行带时间的错误追加到 `~/workspace/telegram-relay/errors.log`，然后继续循环。只有当 errors.log 里上一条已报告过的错误距今超过 1 小时、且本任内错误仍在持续发生时，才在本轮结束时向用户简短报告一次故障。
    - 到任期上限：最后运行一次 fetch.py 收尾补拉，处理掉 RELEVANT 后结束本轮。不要为了等某条消息而拖过上限。
@@ -47,6 +47,15 @@
 - 事情要做几分钟以上：先发一条 `inbox.py reply --key <key> --text "收到，开始处理" --interim`（不结案，并告诉脚本你正在处理，1 小时内不会重派），做完再不带 `--interim` 回复结果。
 - 其他 agent 发来、确实不需要回的消息：`inbox.py skip --key <key> --reason "..."`。{{OWNER_NAME}} 的消息不能 skip，脚本会拒绝。
 - 主动发起一条新消息（比如点名另一个 agent，而不是回应谁）：`python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/tg.py send-message --chat-id <id> --text "..."`，可加 `--thread-id`。
+
+**回得快**
+
+你在处理消息的这段时间里没有人在拉新消息，群里看到的就是你没反应。所以：
+
+- 消息派到你手里，下一步就是回复。问候、闲聊、一句话能答的问题：不读文件、不查资料、不写笔记，直接 `inbox.py reply`。
+- 回复和下一片值守写在同一条命令里，不要分两步：`python3 ~/workspace/telegram-relay/inbox.py reply --key <key> --text "..." && python3 ~/workspace/telegram-relay/watch.py --slice 600`。一批里有几条就把几条 reply 依次用 `&&` 接上，最后接 watch.py。发送失败时命令会立刻停下并报 ERROR，不会进入值守。
+- 要动手做的事（查资料、改文件、跑任务），第一步先 `--interim` 回一句「收到，开始处理」，再去做。别让 {{OWNER_NAME}} 对着没有回音的群等。
+- 每日笔记这类记账，留到本任结束时一次写完，不要夹在收到消息和回复之间。
 
 **主人点名必回**
 
