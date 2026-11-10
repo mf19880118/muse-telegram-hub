@@ -12,3 +12,4 @@ b2b_window.json
 watcher-state.json
 watch.lock
 *.log
+claims.json

@@ -25,7 +25,7 @@
 4. 值守循环（watcher 任内，反复执行到本任满约 60 分钟）：
    - 每片跑完立刻刷新 `watcher-state.json` 的 `beat_at`（`started_at` 不动）。
    - NONE：继续下一片。
-   - RELEVANT：读取 `~/workspace/telegram-relay/queue.jsonl` 末尾的新记录（按需多读同一会话的此前记录作上下文），按下方发言纪律判断和行动，处理完继续循环。
+   - RELEVANT：输出里每一行是一条派给你的消息（JSON，带 `key`）。逐条处理：需要上下文就读 `~/workspace/telegram-relay/queue.jsonl` 里同一会话的此前记录，按下方发言纪律行动，然后用 `inbox.py` 结案（见「收件与结案」）。本批全部结案后再继续循环。带 `"redelivered": true` 的是之前拉到却一直没人回的消息，照常处理。
    - LOCKED：说明接管者已经抢到切片、本任已被接替——体面退场：直接结束本轮，不做收尾 fetch，不发消息、不记日志。
    - ERROR：把一行带时间的错误追加到 `~/workspace/telegram-relay/errors.log`，然后继续循环。只有当 errors.log 里上一条已报告过的错误距今超过 1 小时、且本任内错误仍在持续发生时，才在本轮结束时向用户简短报告一次故障。
    - 到任期上限：最后运行一次 fetch.py 收尾补拉，处理掉 RELEVANT 后结束本轮。不要为了等某条消息而拖过上限。
@@ -35,18 +35,24 @@
 
 - 只有持锁的切片能调 getUpdates：watch.py 已用文件锁保证同一时刻只有一个切片在拉消息；交接靠 --wait-lock 在锁上排队，不要改走 fetch.py 硬拉（决策流程里的补漏 fetch 除外）。
 - offset 只在消息落盘后推进：fetch.py / watch.py 都是先把消息追加进 queue.jsonl、再更新 state.json 的 offset；宁可重拉，不可丢消息。
-- 回复前必查 handled.txt：同一条消息（chat_id:message_id）已处理过的绝不重复回复；每处理完一条就立刻追加记入 `~/workspace/telegram-relay/handled.txt`。
+- 哪些消息还欠着回复，由脚本记账，不靠你记：派给你的消息在用 `inbox.py` 结案之前一直算未完成，约 10 分钟没结案就会重新派出来，派给当时在岗的 watcher。所以换班、中断都不用你补救，也不要去翻 queue.jsonl 自己找漏掉的消息。
+- 绝不手写 `handled.txt`。接管、恢复、收尾时绝不把消息批量记成已处理：没有逐条回复过的消息，就是没处理。
 - 绝不回复自己发的消息。其他 agent 发来的消息，拿不准该不该回时，不回。{{OWNER_NAME}} 点名你的消息必须回，见下方「主人点名必回」。
 
 ## 发言纪律（多 agent 版）
 
-在 Telegram 里用 `python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/tg.py send-message --chat-id <id> --text "..."` 发言，可加 `--reply-to` 和 `--thread-id`。
+**收件与结案**
+
+- 回应一条派给你的消息：`python3 ~/workspace/telegram-relay/inbox.py reply --key <key> --text "..."`。它会回复那条消息，Telegram 确认发出后才结案；发送失败会报 ERROR，消息保持未完成，修好再发。长文本用 `--text-file <文件>`。
+- 事情要做几分钟以上：先发一条 `inbox.py reply --key <key> --text "收到，开始处理" --interim`（不结案，并告诉脚本你正在处理，1 小时内不会重派），做完再不带 `--interim` 回复结果。
+- 其他 agent 发来、确实不需要回的消息：`inbox.py skip --key <key> --reason "..."`。{{OWNER_NAME}} 的消息不能 skip，脚本会拒绝。
+- 主动发起一条新消息（比如点名另一个 agent，而不是回应谁）：`python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/tg.py send-message --chat-id <id> --text "..."`，可加 `--thread-id`。
 
 **主人点名必回**
 
-- 脚本只在消息点名你时才叫醒你。凡是 {{OWNER_NAME}} 发来并叫醒了你的消息（`@你的用户名`、回复你的某条消息、提到你的称呼、`@all` / `@所有人`），你都必须用 `--reply-to` 回复那条消息，哪怕它只是一句问候、一句通知，没有提任何问题。
+- 脚本只在消息点名你时才叫醒你。凡是 {{OWNER_NAME}} 发来并叫醒了你的消息（`@你的用户名`、回复你的某条消息、提到你的称呼、`@all` / `@所有人`），你都必须用 `inbox.py reply` 回复那条消息，哪怕它只是一句问候、一句通知，没有提任何问题。
 - `@all` / `@所有人` 是在叫每一个 agent，各回各的。不要因为别的 agent 已经回了、或者觉得这只是闲聊，就不回。
-- 先回复，再把这条消息记入 handled.txt。绝不允许只记 handled 而不回复。
+- 让你去做事的消息（改配置、查资料、跑任务），做完后回复里要说清楚实际做了什么；没做成也要回复说明卡在哪。
 
 **谁的话算数**
 
@@ -57,7 +63,7 @@
 **怎么叫人**
 
 - 要另一个 agent 动手，必须在消息里写它的 `@bot用户名`（照花名册），并且把话说全：要它做什么、需要它回什么、你已经知道什么。对方看不到你的电脑，也不一定读过前文。一条消息最多点 2 个 agent。
-- 回应别的 agent 交给你的事，用 `--reply-to` 回复它那条消息，这样它才会被叫醒。
+- 回应别的 agent 交给你的事，用 `inbox.py reply` 回复它那条消息，这样它才会被叫醒。
 - 不写 `@` 也不回复的消息谁都叫不醒，适合用来向 {{OWNER_NAME}} 汇报进度。汇报里要提到别的 agent 时用称呼，不要写 `@用户名`，免得白白把它叫醒。
 - 不要 @ 自己。`@all` 只有 {{OWNER_NAME}} 能用，agent 发了也无效。
 

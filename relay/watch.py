@@ -47,18 +47,6 @@ import fetch as F  # noqa: E402
 LOCK = os.path.join(BASE, "watch.lock")
 
 
-def digest_line(r: dict) -> str:
-    line = {
-        "chat_id": r["chat_id"], "chat_type": r["chat_type"],
-        "chat_title": r["chat_title"], "thread_id": r["thread_id"],
-        "from": r["from_username"] or r["from_name"],
-        "from_is_bot": r["from_is_bot"],
-        "message_id": r["message_id"],
-        "text": (r["text"] or "")[:300],
-    }
-    return json.dumps(line, ensure_ascii=False)
-
-
 def main() -> int:
     slice_secs = 600
     if "--slice" in sys.argv:
@@ -80,6 +68,15 @@ def main() -> int:
             time.sleep(min(5.0, max(0.1, wait_deadline - time.time())))
     deadline = time.time() + slice_secs
     while True:
+        # Messages pulled earlier (by this or a previous shift) that are
+        # still unanswered and unclaimed are handed out again first.
+        due = F.due_pending()
+        if due:
+            F.claim([F.record_key(r) for r in due])
+            print(f"RELEVANT {len(due)}")
+            for r in due:
+                print(F.digest(r, redelivered=True))
+            return 0
         remaining = deadline - time.time()
         if remaining <= 0:
             print("NONE")
@@ -116,17 +113,20 @@ def main() -> int:
                     except Exception:
                         pass
                     continue
+                wake = F.should_wake(record)
+                record["wake"] = wake
                 qf.write(json.dumps(record, ensure_ascii=False) + "\n")
-                if F.should_wake(record):
+                if wake:
                     relevant.append(record)
                     F.mark_read(record)
                     F.signal_typing(record)
                     F.signal_watchdog(record)
         F.save_offset(max_id + 1)
         if relevant:
+            F.claim([F.record_key(r) for r in relevant])
             print(f"RELEVANT {len(relevant)}")
             for r in relevant:
-                print(digest_line(r))
+                print(F.digest(r))
             return 0
 
 

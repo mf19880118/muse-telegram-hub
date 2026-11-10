@@ -187,6 +187,31 @@ try:
 except (TypeError, ValueError):
     B2B_WINDOW_SECS = 600
 B2B_STATE = os.path.join(BASE, "b2b_window.json")
+
+# --- Script-owned inbox ------------------------------------------------
+# Which messages still owe a reply is tracked here, not in the agent's
+# head, so nothing is lost when one watcher shift hands over to the
+# next. Every queue record carries "wake": true/false. A wake record
+# stays pending until its key (chat_id:message_id) is in handled.txt,
+# which inbox.py writes only after a reply was actually sent.
+# When a pending message is reported to the agent it is claimed for
+# claim_ttl_secs; if it is still pending when the claim runs out it is
+# reported again (marked "redelivered"), to whichever watcher is on
+# duty by then. An interim reply extends the claim to working_ttl_secs.
+HANDLED = os.path.join(BASE, "handled.txt")
+CLAIMS = os.path.join(BASE, "claims.json")
+
+
+def _cfg_int(name: str, default: int) -> int:
+    try:
+        return int(_CONFIG.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+CLAIM_TTL = _cfg_int("claim_ttl_secs", 600)
+WORKING_TTL = _cfg_int("working_ttl_secs", 3600)
+PENDING_MAX_AGE = _cfg_int("pending_max_age_secs", 86400)
 THROTTLED = os.path.join(BASE, "throttled.log")
 THROTTLE_NOTICE = ("⏸ 机器人之间来回太密，我先暂停接其他 agent 的消息。"
                    "需要继续的话，请主人直接 @ 我。")
@@ -393,6 +418,133 @@ def should_wake(record: dict) -> bool:
     return is_relevant(record) and not b2b_throttled(record)
 
 
+def record_key(record: dict):
+    """chat_id:message_id, or None for records without a message."""
+    if record.get("chat_id") is None or not record.get("message_id"):
+        return None
+    return "%s:%s" % (record["chat_id"], record["message_id"])
+
+
+def load_handled() -> set:
+    try:
+        with open(HANDLED, "r", encoding="utf-8") as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except Exception:
+        return set()
+
+
+def mark_handled(key: str) -> None:
+    if key in load_handled():
+        return
+    with open(HANDLED, "a", encoding="utf-8") as fh:
+        fh.write(key + "\n")
+
+
+def load_claims() -> dict:
+    try:
+        with open(CLAIMS, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def claim(keys, ttl: int = None, now: float = None) -> None:
+    """Mark messages as being worked on until now + ttl."""
+    keys = [k for k in keys if k]
+    if not keys:
+        return
+    now = time.time() if now is None else now
+    ttl = CLAIM_TTL if ttl is None else ttl
+    claims = {k: v for k, v in load_claims().items()
+              if isinstance(v, (int, float)) and v > now - 86400}
+    for key in keys:
+        claims[key] = now + ttl
+    try:
+        tmp = CLAIMS + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(claims, fh)
+        os.replace(tmp, CLAIMS)
+    except Exception:
+        pass
+
+
+def queue_records(limit: int = 5000) -> list:
+    try:
+        with open(QUEUE, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()[-limit:]
+    except Exception:
+        return []
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def find_record(key: str):
+    """Latest queue record with this key, or None."""
+    found = None
+    for rec in queue_records():
+        if record_key(rec) == key:
+            found = rec
+    return found
+
+
+def pending_records(now: float = None) -> list:
+    """Messages that woke the agent and have not been answered yet."""
+    now = time.time() if now is None else now
+    handled = load_handled()
+    by_key = {}
+    for rec in queue_records():
+        if not rec.get("wake"):
+            continue
+        if rec.get("kind") not in ("message", "edited_message"):
+            continue
+        key = record_key(rec)
+        if not key or key in handled:
+            continue
+        date = rec.get("date")
+        if isinstance(date, (int, float)) and now - date > PENDING_MAX_AGE:
+            continue
+        by_key[key] = rec
+    return list(by_key.values())
+
+
+def due_pending(now: float = None) -> list:
+    """Pending messages nobody is currently working on."""
+    now = time.time() if now is None else now
+    claims = load_claims()
+    out = []
+    for rec in pending_records(now):
+        expires = claims.get(record_key(rec))
+        if isinstance(expires, (int, float)) and expires > now:
+            continue
+        out.append(rec)
+    return out
+
+
+def digest(record: dict, redelivered: bool = False) -> str:
+    line = {
+        "key": record_key(record),
+        "chat_id": record.get("chat_id"),
+        "chat_type": record.get("chat_type"),
+        "chat_title": record.get("chat_title"),
+        "thread_id": record.get("thread_id"),
+        "from": record.get("from_username") or record.get("from_name"),
+        "from_is_bot": record.get("from_is_bot"),
+        "message_id": record.get("message_id"),
+        "text": (record.get("text") or "")[:300],
+    }
+    if redelivered:
+        line["redelivered"] = True
+    return json.dumps(line, ensure_ascii=False)
+
+
 def is_relevant(record: dict) -> bool:
     if record["from_id"] == BOT_ID:
         return False
@@ -531,28 +683,28 @@ def main() -> int:
                 except Exception:
                     pass
                 continue
+            wake = should_wake(record)
+            record["wake"] = wake
             qf.write(json.dumps(record, ensure_ascii=False) + "\n")
-            if should_wake(record):
+            if wake:
                 relevant.append(record)
                 mark_read(record)
                 signal_typing(record)
                 signal_watchdog(record)
     if updates:
         save_offset(max_id + 1)
-    if not relevant:
+    claim([record_key(r) for r in relevant])
+    # Anything an earlier shift pulled but never answered comes back here.
+    due = due_pending()
+    claim([record_key(r) for r in due])
+    if not relevant and not due:
         print("NONE")
         return 0
-    print(f"RELEVANT {len(relevant)}")
+    print(f"RELEVANT {len(relevant) + len(due)}")
     for r in relevant:
-        line = {
-            "chat_id": r["chat_id"], "chat_type": r["chat_type"],
-            "chat_title": r["chat_title"], "thread_id": r["thread_id"],
-            "from": r["from_username"] or r["from_name"],
-            "from_is_bot": r["from_is_bot"],
-            "message_id": r["message_id"],
-            "text": (r["text"] or "")[:300],
-        }
-        print(json.dumps(line, ensure_ascii=False))
+        print(digest(r))
+    for r in due:
+        print(digest(r, redelivered=True))
     return 0
 
 

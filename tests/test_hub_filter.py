@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 RELAY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -32,9 +33,13 @@ def load(name: str, config: dict, filename: str = "fetch.py"):
     stub = os.path.join(base, "stub")
     os.makedirs(stub)
     with open(os.path.join(stub, "tg.py"), "w", encoding="utf-8") as fh:
-        fh.write("CALLS = []\nRESPONSES = []\n"
+        fh.write("CALLS = []\nRESPONSES = []\nFAIL = set()\n"
                  "def call(method, params, http_timeout=40.0):\n"
                  "    CALLS.append((method, params))\n"
+                 "    if method in FAIL:\n"
+                 "        return {'ok': False, 'description': 'boom'}\n"
+                 "    if method == 'sendMessage':\n"
+                 "        return {'ok': True, 'result': {'message_id': 7000 + len(CALLS)}}\n"
                  "    if method == 'getUpdates':\n"
                  "        return RESPONSES.pop(0) if RESPONSES else "
                  "{'ok': True, 'result': []}\n"
@@ -65,7 +70,7 @@ def upd(uid, text, from_id, is_bot=False, chat_id=GROUP, chat_type="supergroup",
         reply_to_from=None, edited=False, mid=None):
     msg = {
         "message_id": mid if mid is not None else uid,
-        "date": 1700000000 + uid,
+        "date": int(time.time()),
         "chat": {"id": chat_id, "type": chat_type, "title": "hub"},
         "from": {"id": from_id, "is_bot": is_bot, "first_name": "n%s" % from_id,
                  "username": "u%s" % from_id},
@@ -268,6 +273,139 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(out[0].startswith("ERROR"))
         self.assertEqual(F.load_offset(), 0)
+
+
+class Inbox(unittest.TestCase):
+    """Reply tracking is owned by the scripts, so a shift handover
+    cannot lose a message (the 2026-11-10 incident: a message pulled
+    in the gap between two watcher terms was marked handled by the new
+    watcher without ever being answered)."""
+
+    KEY = "%s:2" % GROUP
+
+    def setUp(self):
+        self.I = load("inbox_t", HUB, filename="inbox.py")
+        self.F = self.I.F
+        self.F.tg.RESPONSES.append({"ok": True, "result": [
+            upd(1, "闲聊一句", OWNER),
+            upd(2, "@所有人 更新值守规则", OWNER),
+            upd(4, "@Alpha_bot 帮我核对", OTHER, is_bot=True),
+        ]})
+        self.out = self.run_fetch()
+
+    def run_fetch(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.F.main()
+        return buf.getvalue().splitlines()
+
+    def call(self, fn, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = fn(*args)
+        return rc, buf.getvalue()
+
+    def keys(self, records):
+        return sorted(self.F.record_key(r) for r in records)
+
+    def test_digest_carries_keys_and_only_wake_records_are_pending(self):
+        self.assertEqual(self.out[0], "RELEVANT 2")
+        self.assertEqual([json.loads(l)["key"] for l in self.out[1:]],
+                         [self.KEY, "%s:4" % GROUP])
+        self.assertEqual(self.keys(self.F.pending_records()),
+                         sorted([self.KEY, "%s:4" % GROUP]))
+
+    def test_claimed_messages_are_not_handed_out_twice(self):
+        self.assertEqual(self.F.due_pending(), [])
+        self.assertEqual(self.run_fetch(), ["NONE"])
+
+    def test_unanswered_message_is_redelivered_after_claim_expires(self):
+        later = time.time() + self.F.CLAIM_TTL + 1
+        self.assertEqual(self.keys(self.F.due_pending(now=later)),
+                         sorted([self.KEY, "%s:4" % GROUP]))
+
+    def test_new_shift_gets_the_lost_message_from_watch_slice(self):
+        # Simulate the claim running out, then a fresh watcher slice.
+        with open(self.F.CLAIMS, "w", encoding="utf-8") as fh:
+            json.dump({}, fh)
+        W = load("watch_redeliver", HUB, filename="watch.py")
+        # Same relay dir contents: copy the state across.
+        import shutil
+        for name in ("queue.jsonl", "state.json"):
+            shutil.copy(os.path.join(os.path.dirname(self.F.QUEUE), name),
+                        os.path.join(os.path.dirname(W.F.QUEUE), name))
+        old = sys.argv
+        sys.argv = ["x", "--slice", "5"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                W.main()
+        finally:
+            sys.argv = old
+        out = buf.getvalue().splitlines()
+        self.assertEqual(out[0], "RELEVANT 2")
+        self.assertTrue(all(json.loads(l)["redelivered"] for l in out[1:]))
+        self.assertEqual([c for c in W.F.tg.CALLS if c[0] == "getUpdates"], [],
+                         "handed out before polling for new messages")
+
+    def test_reply_sends_then_closes(self):
+        rc, out = self.call(self.I.cmd_reply, self.KEY, "已更新", False)
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.startswith("DONE"))
+        sent = [c[1] for c in self.F.tg.CALLS if c[0] == "sendMessage"]
+        self.assertEqual(sent[-1]["chat_id"], GROUP)
+        self.assertEqual(sent[-1]["reply_parameters"]["message_id"], 2)
+        self.assertIn(self.KEY, self.F.load_handled())
+        self.assertNotIn(self.KEY, self.keys(self.F.pending_records()))
+
+    def test_failed_send_leaves_message_open(self):
+        self.F.tg.FAIL.add("sendMessage")
+        rc, out = self.call(self.I.cmd_reply, self.KEY, "已更新", False)
+        self.assertEqual(rc, 1)
+        self.assertNotIn(self.KEY, self.F.load_handled())
+        self.assertIn(self.KEY, self.keys(self.F.pending_records()))
+
+    def test_empty_reply_is_refused(self):
+        rc, _ = self.call(self.I.cmd_reply, self.KEY, "   ", False)
+        self.assertEqual(rc, 2)
+        self.assertNotIn(self.KEY, self.F.load_handled())
+
+    def test_interim_reply_keeps_open_and_extends_claim(self):
+        rc, out = self.call(self.I.cmd_reply, self.KEY, "收到，在处理", True)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.KEY, self.F.load_handled())
+        later = time.time() + self.F.CLAIM_TTL + 1
+        self.assertNotIn(self.KEY, self.keys(self.F.due_pending(now=later)))
+        much_later = time.time() + self.F.WORKING_TTL + 1
+        self.assertIn(self.KEY, self.keys(self.F.due_pending(now=much_later)))
+
+    def test_owner_message_cannot_be_skipped(self):
+        rc, out = self.call(self.I.cmd_skip, self.KEY, "只是通知")
+        self.assertEqual(rc, 2)
+        self.assertTrue(out.startswith("REFUSED"))
+        self.assertNotIn(self.KEY, self.F.load_handled())
+
+    def test_bot_message_can_be_skipped(self):
+        key = "%s:4" % GROUP
+        rc, out = self.call(self.I.cmd_skip, key, "纯确认")
+        self.assertEqual(rc, 0)
+        self.assertIn(key, self.F.load_handled())
+
+    def test_long_reply_is_split(self):
+        rc, _ = self.call(self.I.cmd_reply, self.KEY, "字" * 9000, False)
+        self.assertEqual(rc, 0)
+        sent = [c[1] for c in self.F.tg.CALLS if c[0] == "sendMessage"]
+        self.assertEqual([len(m["text"]) for m in sent], [4000, 4000, 1000])
+        self.assertIn("reply_parameters", sent[0])
+        self.assertNotIn("reply_parameters", sent[1])
+
+    def test_old_messages_stop_being_pending(self):
+        far = time.time() + self.F.PENDING_MAX_AGE + 10
+        self.assertEqual(self.F.pending_records(now=far), [])
+
+    def test_list_shows_open_messages(self):
+        rc, out = self.call(self.I.cmd_list)
+        self.assertEqual(out.splitlines()[0], "OPEN 2")
 
 
 class UpstreamBehaviourUnchanged(unittest.TestCase):
