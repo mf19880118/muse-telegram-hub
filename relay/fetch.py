@@ -221,7 +221,6 @@ PENDING_MAX_AGE = _cfg_int("pending_max_age_secs", 86400)
 # a quiet 600-second slice the heartbeat looked stale (the supervisor's
 # limit is 180s) and a healthy watcher could be taken for a dead one.
 WATCHER_STATE = os.path.join(BASE, "watcher-state.json")
-BEAT_STALE = _cfg_int("beat_stale_secs", 180)
 
 # How many earlier messages of the same chat are attached to a message
 # when it is handed to the agent, so that a reply usually needs no
@@ -476,18 +475,19 @@ def load_watcher_state() -> dict:
 def beat(new_term: bool = False, now: float = None) -> dict:
     """Refresh the watcher heartbeat and return the state written.
 
-    started_at is kept for as long as the same term goes on. A new term
-    starts when it is asked for (a takeover), when there is no usable
-    state, or when the previous heartbeat is stale: nobody was on duty,
-    so whoever polls now is a new watcher. Best-effort, never raises.
+    started_at marks the start of the current watcher term. It is kept
+    until a new term is asked for (the first slice of a takeover or a
+    recovery) or the state is missing or unreadable. A stale heartbeat
+    alone does not start a new term: the same watcher may just have
+    spent a few minutes answering a message between two slices, and
+    moving its start time there would hide from the supervisor that
+    the term is due for a handover. Best-effort, never raises.
     """
     now = time.time() if now is None else now
     state = load_watcher_state()
     started = state.get("started_at")
-    last = state.get("beat_at")
-    if (new_term or not isinstance(started, (int, float))
-            or not isinstance(last, (int, float))
-            or now - last >= BEAT_STALE):
+    if (new_term or isinstance(started, bool)
+            or not isinstance(started, (int, float))):
         started = now
     state = {"started_at": int(started), "beat_at": int(now)}
     try:
@@ -579,6 +579,11 @@ def due_pending(now: float = None) -> list:
     return out
 
 
+def _clip(text: str, limit: int) -> str:
+    """Cut text to limit characters, marking the cut with an ellipsis."""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def recent_context(record: dict, limit: int = None) -> list:
     """The last few earlier messages of the same chat, oldest first.
 
@@ -604,13 +609,19 @@ def recent_context(record: dict, limit: int = None) -> list:
         seen.pop(rec["message_id"], None)  # an edit moves it to the end
         seen[rec["message_id"]] = {
             "from": rec.get("from_username") or rec.get("from_name"),
-            "text": rec["text"][:160],
+            "text": _clip(rec["text"], 160),
         }
     return list(seen.values())[-limit:]
 
 
 def digest(record: dict, redelivered: bool = False,
-           context: bool = True) -> str:
+           context: bool = True, max_text: int = None) -> str:
+    """One JSON line describing a message handed to the agent.
+
+    The text is given in full unless max_text is set, so the agent can
+    answer from this line alone and never works from a cut-off message.
+    """
+    text = record.get("text") or ""
     line = {
         "key": record_key(record),
         "chat_id": record.get("chat_id"),
@@ -620,7 +631,7 @@ def digest(record: dict, redelivered: bool = False,
         "from": record.get("from_username") or record.get("from_name"),
         "from_is_bot": record.get("from_is_bot"),
         "message_id": record.get("message_id"),
-        "text": (record.get("text") or "")[:300],
+        "text": text if max_text is None else _clip(text, max_text),
     }
     if redelivered:
         line["redelivered"] = True

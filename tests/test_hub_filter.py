@@ -433,16 +433,18 @@ class Heartbeat(unittest.TestCase):
         self.assertEqual(state, {"started_at": 1000, "beat_at": 1000})
         self.assertEqual(self.F.load_watcher_state(), state)
 
-    def test_fresh_beats_keep_the_term(self):
+    def test_later_beats_keep_the_term(self):
         self.F.beat(now=1000.0)
-        state = self.F.beat(now=1000.0 + self.F.BEAT_STALE - 1)
-        self.assertEqual(state["started_at"], 1000)
-        self.assertEqual(state["beat_at"], 1000 + self.F.BEAT_STALE - 1)
+        state = self.F.beat(now=1050.0)
+        self.assertEqual(state, {"started_at": 1000, "beat_at": 1050})
 
-    def test_stale_beat_starts_a_new_term(self):
+    def test_gap_between_slices_does_not_restart_the_term(self):
+        # The watcher spent 20 minutes on a task between two slices.
+        # Its term must still look as old as it is, or the supervisor
+        # would not hand over at 50 minutes and the watch would lapse.
         self.F.beat(now=1000.0)
-        state = self.F.beat(now=1000.0 + self.F.BEAT_STALE)
-        self.assertEqual(state["started_at"], 1000 + self.F.BEAT_STALE)
+        state = self.F.beat(now=1000.0 + 1200)
+        self.assertEqual(state["started_at"], 1000)
 
     def test_new_term_flag_resets_a_fresh_term(self):
         self.F.beat(now=1000.0)
@@ -544,6 +546,37 @@ class ContextAndTiming(unittest.TestCase):
         rc, out = self.call(self.I.cmd_list)
         self.assertEqual(out[0], "OPEN 2")
         self.assertTrue(all("context" not in json.loads(l) for l in out[1:]))
+
+    def test_message_text_is_handed_out_in_full(self):
+        long_text = "@Alpha_bot " + "字" * 2000
+        rec = self.F.compact(upd(50, long_text, OWNER))
+        self.assertEqual(json.loads(self.F.digest(rec))["text"], long_text)
+        short = json.loads(self.F.digest(rec, max_text=300))["text"]
+        self.assertEqual(len(short), 301)
+        self.assertTrue(short.endswith("…"))
+
+    def test_cut_context_is_marked(self):
+        self.F.tg.RESPONSES.append({"ok": True, "result": [
+            upd(60, "长" * 500, OWNER), upd(61, "@Alpha_bot 看上面", OWNER)]})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.F.main()
+        line = json.loads(buf.getvalue().splitlines()[1])
+        self.assertEqual(line["context"][-1]["text"], "长" * 160 + "…")
+
+    def test_edited_message_does_not_count_as_a_long_wait(self):
+        old = upd(70, "@Alpha_bot 改过的话", OWNER, edited=True)
+        old["edited_message"]["date"] = int(time.time()) - 5000
+        self.F.tg.RESPONSES.append({"ok": True, "result": [old]})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.F.main()
+        self.call(self.I.cmd_reply, "%s:70" % GROUP, "好", False)
+        with open(self.I.LATENCY, encoding="utf-8") as fh:
+            row = [json.loads(l) for l in fh][-1]
+        self.assertNotIn("total_secs", row)
+        self.assertNotIn("wait_secs", row)
+        self.assertIn("handle_secs", row)
 
     def test_queue_records_carry_the_pull_time(self):
         rec = self.F.find_record(self.KEY)

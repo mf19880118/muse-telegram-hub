@@ -65,6 +65,8 @@ def log_latency(key: str, record: dict, interim: bool) -> None:
         entry = {"key": key, "at": int(now), "interim": bool(interim),
                  "from": record.get("from_username") or record.get("from_name"),
                  "from_is_bot": bool(record.get("from_is_bot"))}
+        if record.get("kind") == "edited_message":
+            sent = None  # its date is when the original was sent
         if isinstance(sent, (int, float)):
             entry["total_secs"] = int(now - sent)
             if isinstance(pulled, (int, float)):
@@ -121,7 +123,7 @@ def cmd_list() -> int:
     pending = F.pending_records(now)
     print("OPEN %d" % len(pending))
     for rec in pending:
-        line = json.loads(F.digest(rec, context=False))
+        line = json.loads(F.digest(rec, context=False, max_text=300))
         expires = claims.get(line["key"])
         left = int(expires - now) if isinstance(expires, (int, float)) else 0
         line["claimed_for_secs"] = max(0, left)
