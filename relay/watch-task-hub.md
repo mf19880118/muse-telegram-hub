@@ -36,11 +36,17 @@
 - 只有持锁的切片能调 getUpdates：watch.py 已用文件锁保证同一时刻只有一个切片在拉消息；交接靠 --wait-lock 在锁上排队，不要改走 fetch.py 硬拉（决策流程里的补漏 fetch 除外）。
 - offset 只在消息落盘后推进：fetch.py / watch.py 都是先把消息追加进 queue.jsonl、再更新 state.json 的 offset；宁可重拉，不可丢消息。
 - 回复前必查 handled.txt：同一条消息（chat_id:message_id）已处理过的绝不重复回复；每处理完一条就立刻追加记入 `~/workspace/telegram-relay/handled.txt`。
-- 绝不回复自己发的消息；与你无关的群聊闲谈不插话；拿不准该不该回时，不回。
+- 绝不回复自己发的消息。其他 agent 发来的消息，拿不准该不该回时，不回。{{OWNER_NAME}} 点名你的消息必须回，见下方「主人点名必回」。
 
 ## 发言纪律（多 agent 版）
 
 在 Telegram 里用 `python3 ~/workspace/custom-connectors/custom.telegram-bot/bin/tg.py send-message --chat-id <id> --text "..."` 发言，可加 `--reply-to` 和 `--thread-id`。
+
+**主人点名必回**
+
+- 脚本只在消息点名你时才叫醒你。凡是 {{OWNER_NAME}} 发来并叫醒了你的消息（`@你的用户名`、回复你的某条消息、提到你的称呼、`@all` / `@所有人`），你都必须用 `--reply-to` 回复那条消息，哪怕它只是一句问候、一句通知，没有提任何问题。
+- `@all` / `@所有人` 是在叫每一个 agent，各回各的。不要因为别的 agent 已经回了、或者觉得这只是闲聊，就不回。
+- 先回复，再把这条消息记入 handled.txt。绝不允许只记 handled 而不回复。
 
 **谁的话算数**
 
@@ -58,7 +64,7 @@
 **怎么收尾（防来回刷屏）**
 
 - 每条由 agent 发给 agent 的消息，末尾带一个跳数标记 `[跳 n/6]`：{{OWNER_NAME}} 发起的任务，第一条 agent 间消息是 `[跳 1/6]`，你回应或转交时把收到的 n 加 1。收到 `[跳 6/6]` 时不再找任何 agent，改为向 {{OWNER_NAME}} 汇报现状并停下。
-- 不回复纯确认类消息（「收到」「好的」「谢谢」「我在处理」），自己也不发这类消息给别的 agent。对方交付的结果够用了就直接用，不必道谢。
+- 不回复其他 agent 发来的纯确认类消息（「收到」「好的」「谢谢」「我在处理」），自己也不发这类消息给别的 agent。对方交付的结果够用了就直接用，不必道谢。这一条只管 agent 之间，对 {{OWNER_NAME}} 的消息不适用。
 - 一件事做完，由最初被 {{OWNER_NAME}} 点名的那个 agent 用一条消息回复 {{OWNER_NAME}} 的原始消息作总结，里面不 @ 任何 agent。
 - 与别的 agent 就某个事实有分歧：各摆证据和来源，最多来回 2 轮。谈不拢就找主人裁决，然后停下。
 - 如果群里出现「⏸ 机器人之间来回太密」的提示，说明脚本层的限流已经触发：停止给那个 agent 发消息，等 {{OWNER_NAME}} 发话。
